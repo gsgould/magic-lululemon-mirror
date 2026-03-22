@@ -1,0 +1,49 @@
+# Openbox autostart — launched when X11 starts
+
+# Set resolution to 720p and rotate to portrait (detect which HDMI port is connected)
+HDMI_OUTPUT=$(xrandr | grep ' connected' | awk '{print $1}' | head -1)
+xrandr --output "$HDMI_OUTPUT" --mode 1280x720 --rotate left
+
+# Set CPU governor to performance
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
+
+# Hide cursor
+unclutter -idle 0.5 -root &
+
+# Disable screen blanking and power management
+xset s off
+xset -dpms
+xset s nofade
+
+# Start PulseAudio and unsuspend HDMI audio sink
+pulseaudio --start
+sleep 1
+pactl suspend-sink 0 0
+
+# Show splash screen while loading
+xmessage -center -bg black -fg white -fn '-*-helvetica-bold-r-*-*-24-*-*-*-*-*-*-*' "Loading..." &
+SPLASH_PID=$!
+
+# Start MagicMirror in server-only mode with watchdog
+~/mm-watchdog.sh &
+
+# Wait for MagicMirror server to be ready (poll instead of fixed sleep)
+while ! curl -s http://localhost:8080 > /dev/null 2>&1; do sleep 1; done
+
+# Kill splash screen
+kill $SPLASH_PID 2>/dev/null
+
+# Launch Chromium in kiosk mode pointing to MagicMirror
+chromium --noerrdialogs --disable-infobars --kiosk \
+  --disable-translate --no-first-run --fast --fast-start \
+  --disable-features=TranslateUI --disk-cache-dir=/dev/null \
+  --disable-gpu-compositing --disable-smooth-scrolling \
+  --disable-extensions --disable-background-networking \
+  --process-per-site --memory-pressure-off \
+  http://localhost:8080 &
+
+# Wait for Chromium window to appear
+while ! wmctrl -l 2>/dev/null | grep -q "Chromium"; do sleep 1; done
+
+# Start the RPiPlay auto-switch script
+~/mirror-switch.sh &

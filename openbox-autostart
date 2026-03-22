@@ -1,11 +1,17 @@
 # Openbox autostart — launched when X11 starts
 
+# Turn on the display via CEC (in case it was in standby)
+cec-ctl -d 1 --playback --to 0 --image-view-on 2>/dev/null
+
 # Set resolution to 720p and rotate to portrait (detect which HDMI port is connected)
 HDMI_OUTPUT=$(xrandr | grep ' connected' | awk '{print $1}' | head -1)
 xrandr --output "$HDMI_OUTPUT" --mode 1280x720 --rotate left
 
 # Set CPU governor to performance
 echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
+
+# Disable WiFi power management (prevents micro-lag on network operations)
+sudo iw wlan0 set power_save off 2>/dev/null
 
 # Hide cursor
 unclutter -idle 0.5 -root &
@@ -15,10 +21,22 @@ xset s off
 xset -dpms
 xset s nofade
 
-# Start PulseAudio and unsuspend HDMI audio sink
+# Start PulseAudio and configure HDMI audio output
 pulseaudio --start
-sleep 1
-pactl suspend-sink 0 0
+# Wait for PulseAudio to be ready
+for i in $(seq 1 10); do
+    pactl info > /dev/null 2>&1 && break
+    sleep 1
+done
+# Find and activate the HDMI audio sink
+HDMI_SINK=$(pactl list short sinks 2>/dev/null | grep -i hdmi | head -1 | awk '{print $2}')
+if [ -n "$HDMI_SINK" ]; then
+    pactl set-default-sink "$HDMI_SINK"
+    pactl suspend-sink "$HDMI_SINK" 0
+else
+    # Fallback: try sink index 0
+    pactl suspend-sink 0 0
+fi
 
 # Show splash screen while loading
 xmessage -center -bg black -fg white -fn '-*-helvetica-bold-r-*-*-24-*-*-*-*-*-*-*' "Loading..." &
@@ -27,8 +45,15 @@ SPLASH_PID=$!
 # Start MagicMirror in server-only mode with watchdog
 ~/mm-watchdog.sh &
 
-# Wait for MagicMirror server to be ready (poll instead of fixed sleep)
-while ! curl -s http://localhost:8080 > /dev/null 2>&1; do sleep 1; done
+# Wait for MagicMirror server to be ready (max 60 seconds)
+MM_WAIT=0
+while ! curl -s http://localhost:8080 > /dev/null 2>&1; do
+    sleep 1
+    MM_WAIT=$((MM_WAIT + 1))
+    if [ "$MM_WAIT" -ge 60 ]; then
+        break
+    fi
+done
 
 # Kill splash screen
 kill $SPLASH_PID 2>/dev/null
@@ -42,8 +67,15 @@ chromium --noerrdialogs --disable-infobars --kiosk \
   --process-per-site --memory-pressure-off \
   http://localhost:8080 &
 
-# Wait for Chromium window to appear
-while ! wmctrl -l 2>/dev/null | grep -q "Chromium"; do sleep 1; done
+# Wait for Chromium window to appear (max 30 seconds)
+CR_WAIT=0
+while ! wmctrl -l 2>/dev/null | grep -q "Chromium"; do
+    sleep 1
+    CR_WAIT=$((CR_WAIT + 1))
+    if [ "$CR_WAIT" -ge 30 ]; then
+        break
+    fi
+done
 
-# Start the RPiPlay auto-switch script
+# Start the AirPlay auto-switch script
 ~/mirror-switch.sh &

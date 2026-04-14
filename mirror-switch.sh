@@ -8,14 +8,62 @@
 export DISPLAY=:0
 
 LOG_FILE="/tmp/mirror-switch.log"
+HEALTH_LOG="/boot/firmware/mirror-health.log"
 POLL_INTERVAL=2
 AIRPLAY_ACTIVE=false
 # Seconds with no connections while Chromium is frozen before we force-restart uxplay
 FROZEN_TIMEOUT=30
 IDLE_SINCE=0
+# Health check every 30 polls (~60 seconds)
+HEALTH_INTERVAL=30
+HEALTH_COUNTER=0
+TEMP_WARN=75
+MEM_WARN_MB=200
+SIGNAL_WARN=-67
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# Write a persistent health event to /boot/firmware (survives power loss)
+log_health() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    log "HEALTH: $1"
+    sudo mount -o remount,rw /boot/firmware 2>/dev/null
+    echo "$msg" | sudo tee -a "$HEALTH_LOG" > /dev/null
+    # Keep log from growing forever (max 500 lines)
+    if [ "$(sudo wc -l < "$HEALTH_LOG" 2>/dev/null)" -gt 500 ]; then
+        sudo tail -250 "$HEALTH_LOG" > /tmp/health-trim.tmp
+        sudo mv /tmp/health-trim.tmp "$HEALTH_LOG"
+    fi
+    sudo mount -o remount,ro /boot/firmware 2>/dev/null
+}
+
+# Check temperature and memory, log if thresholds exceeded
+check_health() {
+    local temp_raw mem_avail_kb mem_avail_mb throttled signal_dbm
+    temp_raw=$(vcgencmd measure_temp 2>/dev/null | grep -oP '[0-9.]+')
+    temp_int=${temp_raw%.*}
+    mem_avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)
+    mem_avail_mb=$((mem_avail_kb / 1024))
+    throttled=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2)
+    signal_dbm=$(awk 'NR>2 {gsub(/\./,"",$4); print -$4}' /proc/net/wireless 2>/dev/null)
+
+    if [ "${temp_int:-0}" -ge "$TEMP_WARN" ]; then
+        log_health "HIGH TEMP: ${temp_raw}C (threshold: ${TEMP_WARN}C) | mem_avail: ${mem_avail_mb}MB | throttled: $throttled | wifi: ${signal_dbm}dBm"
+    fi
+
+    if [ "${mem_avail_mb:-9999}" -le "$MEM_WARN_MB" ]; then
+        log_health "LOW MEMORY: ${mem_avail_mb}MB available (threshold: ${MEM_WARN_MB}MB) | temp: ${temp_raw}C | throttled: $throttled | wifi: ${signal_dbm}dBm"
+    fi
+
+    if [ "$throttled" != "0x0" ] && [ -n "$throttled" ]; then
+        log_health "THROTTLED: $throttled | temp: ${temp_raw}C | mem_avail: ${mem_avail_mb}MB | wifi: ${signal_dbm}dBm"
+    fi
+
+    if [ -n "$signal_dbm" ] && [ "$signal_dbm" -le "$SIGNAL_WARN" ]; then
+        log_health "WEAK WIFI: ${signal_dbm}dBm (threshold: ${SIGNAL_WARN}dBm) | temp: ${temp_raw}C | mem_avail: ${mem_avail_mb}MB"
+    fi
 }
 
 # Show MagicMirror (unfreeze Chromium and bring to front)
@@ -34,11 +82,15 @@ hide_mm() {
 }
 
 # Kill uxplay and all its children (GStreamer pipelines)
+# Also kills any other uxplay instances to avoid mDNS name conflicts on restart.
 kill_uxplay() {
     local pid=$1
     pkill -9 -P "$pid" 2>/dev/null
     kill -9 "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
+    # Kill any straggler uxplay processes to prevent mDNS name conflict
+    pkill -9 uxplay 2>/dev/null
+    sleep 1
 }
 
 # Check if uxplay is actually responsive (not hung)
@@ -54,8 +106,12 @@ is_uxplay_responsive() {
 
 log "Starting mirror-switch — launching uxplay..."
 
+# Ensure no stale uxplay processes (prevents mDNS name conflict)
+pkill -9 uxplay 2>/dev/null
+sleep 1
+
 # Start uxplay in the background (-fs for fullscreen)
-uxplay -n "Mirror" -fs -reset 0 &
+uxplay -n "Mirror" -fs &
 UXPLAY_PID=$!
 log "uxplay started (PID: $UXPLAY_PID)"
 
@@ -105,6 +161,13 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null; do
         IDLE_SINCE=0
     fi
 
+    # Periodic health check
+    HEALTH_COUNTER=$((HEALTH_COUNTER + 1))
+    if [ "$HEALTH_COUNTER" -ge "$HEALTH_INTERVAL" ]; then
+        HEALTH_COUNTER=0
+        check_health
+    fi
+
     sleep "$POLL_INTERVAL"
 done
 
@@ -115,6 +178,7 @@ if [ "$AIRPLAY_ACTIVE" = true ]; then
     show_mm
 fi
 
+log_health "uxplay exited/restarted (was_airplay_active=$AIRPLAY_ACTIVE)"
 log "uxplay exited, restarting in 2 seconds..."
 sleep 2
 exec "$0"
